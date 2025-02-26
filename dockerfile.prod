@@ -1,0 +1,6 @@
+FROM fishaudio/fish-speech:latest-dev
+
+RUN pip3 config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple
+RUN pip3 install gunicorn scipy flask websocket-server websocket-client py-spy fastapi uvicorn
+WORKDIR /root/
+CMD ["/bin/bash"]

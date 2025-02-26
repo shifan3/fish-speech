@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Literal, Optional, Tuple, Union
 
 import click
-import hydra
 import numpy as np
 import torch
 import torch._dynamo.config
@@ -397,7 +396,9 @@ def decode_n_tokens(
         if cur_token[0, 0, -1] == model.tokenizer.get_token_id(IM_END_TOKEN):
             break
 
-    return previous_tokens[:, : i + 1]
+        yield previous_tokens[:, : i + 1], False
+
+    yield previous_tokens[:, : i + 1], True
 
 
 @torch.no_grad()
@@ -409,7 +410,7 @@ def generate(
     max_new_tokens: int,
     decode_one_token=decode_one_token_naive,
     **sampling_kwargs,
-) -> torch.Tensor:
+):
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
@@ -459,21 +460,23 @@ def generate(
     seq[:, T : T + 1] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    x = decode_n_tokens(
-        model,
-        next_token.view(1, codebook_dim, -1),
-        input_pos,
-        max_new_tokens - 1,
-        decode_one_token=decode_one_token,
-        semantic_ids=semantic_ids,
-        **sampling_kwargs,
-    )
-    # x = torch.cat(generated_tokens, dim=1)
-    seq = seq[:, : T + 1 + x.size(1)]
-    seq[:, T + 1 :] = x
-
-    return seq
-
+    YIELD_EVERY = 32
+    YIELD_FIRST = 16
+    for i, (x, is_done) in enumerate(decode_n_tokens(
+            model,
+            next_token.view(1, codebook_dim, -1),
+            input_pos,
+            max_new_tokens - 1,
+            decode_one_token=decode_one_token,
+            semantic_ids=semantic_ids,
+            **sampling_kwargs,
+        )):
+        if is_done or (i > 0 and i % YIELD_EVERY == 0) or i == YIELD_FIRST:
+            # x = torch.cat(generated_tokens, dim=1)
+            seq1 = seq[:, : T + 1 + x.size(1)]
+            seq1[:, T + 1 :] = x
+            yield seq1
+            prev_i = i
 
 def decode_n_tokens_agent(
     model: NaiveTransformer,
@@ -698,15 +701,14 @@ def load_model(checkpoint_path, device, precision, compile=False, is_agent=False
             decode_one_token,
             fullgraph=True,
             backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="reduce-overhead" if torch.cuda.is_available() else None,
+            mode="reduce-overhead" if torch.cuda.is_available() else None
         )
-
     return model.eval(), decode_one_token
 
 
 @dataclass
 class GenerateResponse:
-    action: Literal["sample", "next"]
+    action: Literal["sample", "next", "newseg"]
     codes: Optional[torch.Tensor] = None
     text: Optional[str] = None
 
@@ -838,7 +840,8 @@ def generate_long(
             prompt_length = cat_encoded.size(1)
 
             t0 = time.perf_counter()
-            y = generate(
+            prev_codes = None
+            for j, y in enumerate(generate(
                 model=model,
                 prompt=cat_encoded,
                 max_new_tokens=max_new_tokens,
@@ -846,41 +849,27 @@ def generate_long(
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
-            )
+            )):
+                
+                if sample_idx == 0 and seg_idx == 0 and j == 0 and compile:
+                    logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
 
-            if sample_idx == 0 and seg_idx == 0 and compile:
-                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
-
+                
+                # Put the generated tokens
+                # since there is <im_end>, we remove last token
+                codes = y[1:, prompt_length + 1 :].clone()
+                assert (codes >= 0).all(), f"Negative code found"
+                decoded = y[:, prompt_length:].clone()
+                # But for global encoding, we should keep the <im_end> token
+                global_encoded.append(decoded)
+                assert (codes >= 0).all(), f"Negative code found: {codes}"
+                
+                codes1 = codes[:, prev_codes.shape[1]:] if prev_codes is not None else codes
+                prev_codes = codes
+                yield GenerateResponse(action="sample", codes=codes1, text=texts[seg_idx])
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-
-            t = time.perf_counter() - t0
-
-            tokens_generated = y.size(1) - prompt_length
-            tokens_sec = tokens_generated / t
-            logger.info(
-                f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-            )
-            logger.info(
-                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
-
-            if torch.cuda.is_available():
-                logger.info(
-                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
-                )
-
-            # Put the generated tokens
-            # since there is <im_end>, we remove last token
-            codes = y[1:, prompt_length + 1 :].clone()
-            assert (codes >= 0).all(), f"Negative code found"
-
-            decoded = y[:, prompt_length:].clone()
-            # But for global encoding, we should keep the <im_end> token
-
-            global_encoded.append(decoded)
-            assert (codes >= 0).all(), f"Negative code found: {codes}"
-            yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
+            yield GenerateResponse(action="newseg")
             seg_idx += 1
 
         # This indicates the end of the current sample
@@ -927,7 +916,6 @@ def launch_thread_safe_queue(
 
             kwargs = item.request
             response_queue = item.response_queue
-
             try:
                 for chunk in generate_long(
                     model=model, decode_one_token=decode_one_token, **kwargs
@@ -936,6 +924,8 @@ def launch_thread_safe_queue(
                         WrappedGenerateResponse(status="success", response=chunk)
                     )
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 response_queue.put(WrappedGenerateResponse(status="error", response=e))
 
     threading.Thread(target=worker, daemon=True).start()

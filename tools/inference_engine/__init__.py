@@ -5,6 +5,7 @@ from typing import Generator
 import numpy as np
 import torch
 from loguru import logger
+import time
 
 from fish_speech.models.vqgan.modules.firefly import FireflyArchitecture
 from fish_speech.text.chn_text_norm.text import Text as ChnNormedText
@@ -77,7 +78,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
             )
 
         segments = []
-
+        curr_chunk = None
+        prev_segment = None
         while True:
             # Get the response from the LLAMA model
             wrapped_result: WrappedGenerateResponse = response_queue.get()
@@ -100,9 +102,21 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
                 )
 
             result: GenerateResponse = wrapped_result.response
-            if result.action != "next":
+            
+            if result.action == "newseg":
+                curr_chunk = None
+                prev_segment = None
+            elif result.action == 'sample':
+                if curr_chunk is None:
+                    curr_chunk = result.codes
+                else:
+                    curr_chunk = torch.cat([curr_chunk, result.codes], dim=1)
+                result.codes = curr_chunk
                 segment = self.get_audio_segment(result)
-
+                prev_segment_length = prev_segment.shape[0] if prev_segment is not None else 0
+                prev_segment = segment
+                segment = segment[prev_segment_length:]
+                
                 if req.streaming:  # Used only by the API server
                     yield InferenceResult(
                         code="segment",

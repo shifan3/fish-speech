@@ -17,7 +17,7 @@ class VQManager:
         feature_lengths = torch.tensor(
             [codes.shape[1]], device=self.decoder_model.device
         )
-        logger.info(f"VQ features: {codes.shape}")
+        #logger.info(f"VQ features: {codes.shape}")
 
         if isinstance(self.decoder_model, FireflyArchitecture):
             return self.decoder_model.decode(
